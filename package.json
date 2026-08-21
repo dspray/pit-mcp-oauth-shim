@@ -1,0 +1,16 @@
+{
+  "name": "pit-mcp-oauth-shim",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Shared OAuth discovery + authorize/register/callback/token-redirect-fixup shim for PrecisionIT Entra-gated MCP gateways. Mounted on an existing express app; the host gateway keeps its own inbound JWT validation and write-role gate untouched.",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "devDependencies": {
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
