@@ -81,8 +81,8 @@ function getParam(query, name) {
  * @param {string|() => Promise<string>} opts.clientId      This gateway's Entra app (client) ID
  * @param {string|() => Promise<string>} opts.clientSecret  This gateway's Entra app client secret (only resolved by fixupTokenRedirectUri's caller, never read here directly)
  * @param {string} opts.gatewayBaseUrl This gateway's own https origin, no trailing slash
- * @param {string} opts.entraScope     Full scope string sent to Entra, e.g. `api://<aud>/mcp.access offline_access`
- * @param {string[]} [opts.resourceScopesSupported]  Scopes advertised in PRM/ASM (defaults to [entraScope's resource scope])
+ * @param {string|() => Promise<string>} opts.entraScope  Full scope string sent to Entra, e.g. `api://<aud>/mcp.access offline_access`. May be a function when the scope string is derived from an async-resolved clientId (e.g. `` `${await getClientId()}/mcp.access` ``) — pass opts.resourceScopesSupported explicitly in that case, since it can't be derived from a function synchronously.
+ * @param {string[]} [opts.resourceScopesSupported]  Scopes advertised in PRM/ASM (defaults to [entraScope's resource scope] when entraScope is a plain string; required if entraScope is a function)
  * @param {string} [opts.callbackPath] Path for the shim's own Entra callback (default '/oauth/callback'). Override when the gateway already owns that path for a different OAuth flow (e.g. GitHub's per-user App auth, Procore's, Intuit's).
  * @param {string} [opts.protectedResourceSuffix] Path suffix for RFC 9728's path-suffixed PRM form (default 'mcp', i.e. served at `/.well-known/oauth-protected-resource/mcp`).
  */
@@ -95,7 +95,8 @@ export function createOAuthShimCore(opts) {
   }
 
   const entraBase = `https://login.microsoftonline.com/${tenantId}`;
-  const scopesSupported = resourceScopesSupported ?? [entraScope.split(' ')[0]];
+  const scopesSupported = resourceScopesSupported
+    ?? (typeof entraScope === 'string' ? [entraScope.split(' ')[0]] : []);
   const ownCallbackUrl = `${gatewayBaseUrl}${callbackPath}`;
 
   // stateKey -> { redirectUri, clientState, createdAt }  (consumed at the callback route)
@@ -148,12 +149,13 @@ export function createOAuthShimCore(opts) {
 
   async function handleAuthorize(query) {
     const id = await resolveValue(clientId);
+    const scope = await resolveValue(entraScope);
     const requestedRedirectUri = getParam(query, 'redirect_uri');
     const isLoopback = typeof requestedRedirectUri === 'string' && LOOPBACK_REDIRECT_RE.test(requestedRedirectUri);
 
     const params = new URLSearchParams(query);
     params.set('client_id', id);
-    params.set('scope', entraScope);
+    params.set('scope', scope);
     // RFC 8707 resource indicator conflicts with Entra v2's scope-derived
     // audience (AADSTS9010010) — strip it, same as before this module existed.
     params.delete('resource');

@@ -93,6 +93,7 @@ async function run() {
 
   await runCallbackPathOverride();
   await runAsyncCredentials();
+  await runAsyncScope();
   await runRawAdapter();
 
   console.log(process.exitCode ? '\nSOME CHECKS FAILED' : '\nALL CHECKS PASSED');
@@ -153,6 +154,33 @@ async function runAsyncCredentials() {
   const loc = new URL(authRes.headers.get('location'));
   assert(loc.searchParams.get('client_id') === 'KV_CLIENT_ID', '/authorize resolves an async clientId function');
   assert(secretFetches === 2, 'async clientId resolver is called fresh per request, not cached at mount time (2 calls: register + authorize)');
+
+  server.close();
+}
+
+// n8n/Ramp/Stripe build their Entra scope string FROM the async-resolved
+// clientId (`${clientId}/mcp.access offline_access`) — entraScope itself
+// must be allowed to be an async resolver too, not just a plain string.
+async function runAsyncScope() {
+  const base = 'https://kv-scope-mcp.myprecisionit.com';
+  const app = express();
+  app.use(express.json());
+  const getClientId = async () => 'SCOPE_CLIENT_ID';
+  mountOAuthShim(app, {
+    tenantId: 'T', clientId: getClientId, clientSecret: async () => 'S',
+    gatewayBaseUrl: base,
+    entraScope: async () => `${await getClientId()}/mcp.access offline_access`,
+    resourceScopesSupported: ['SCOPE_CLIENT_ID/mcp.access'],
+  });
+
+  const server = app.listen(0);
+  await new Promise((r) => server.once('listening', r));
+  const port = server.address().port;
+  const local = (p) => `http://127.0.0.1:${port}${p}`;
+
+  const authRes = await fetch(local('/authorize?redirect_uri=https%3A%2F%2Fclaude.ai%2Fapi%2Fmcp%2Fauth_callback&state=S'), { redirect: 'manual' });
+  const loc = new URL(authRes.headers.get('location'));
+  assert(loc.searchParams.get('scope') === 'SCOPE_CLIENT_ID/mcp.access offline_access', '/authorize resolves an async entraScope function derived from the async clientId');
 
   server.close();
 }
