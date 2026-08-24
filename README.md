@@ -51,7 +51,7 @@ already-registered `/oauth/callback` and re-redirecting the browser to the
 caller's real loopback URL itself afterward — see `index.js`'s top comment
 and `pit-mcp-dcr-shim/context/decisions.md` D-008 for the full reasoning.
 
-## Usage
+## Usage (express)
 
 ```js
 import express from 'express';
@@ -75,6 +75,51 @@ The host gateway keeps its own `/token` handler (it already owns attaching
 `redirect_uri` on codes it issued via the loopback swap. Non-loopback token
 exchanges (claude.ai's fixed callback) pass through `fixupTokenRedirectUri`
 unchanged.
+
+## Usage (no express — a hand-rolled router)
+
+Some gateways (e.g. Mosyle) don't use express at all. `mountOAuthShimRaw`
+adapts the same core logic to any router that registers routes as
+`addRoute(method, path, handler)` and hands each handler a raw Node
+`http.IncomingMessage`/`ServerResponse` pair:
+
+```js
+import { mountOAuthShimRaw } from 'pit-mcp-oauth-shim';
+
+const { fixupTokenRedirectUri } = mountOAuthShimRaw(addRoute, {
+  tenantId, clientId, clientSecret, gatewayBaseUrl, entraScope,
+  rawBodyKey: '_body', // property on `req` holding the already-parsed body (default '_body')
+});
+```
+
+## Credentials as a Key Vault resolver, not just an env var
+
+`clientId` and `clientSecret` may each be a plain string OR an
+`async () => string` — several gateways (n8n, Ramp, Stripe) fetch these from
+Key Vault per-request rather than a static env var:
+
+```js
+mountOAuthShim(app, {
+  clientId: () => getSecret('ramp-mcp-oauth-client-id'),
+  clientSecret: () => getSecret('ramp-mcp-oauth-client-secret'),
+  // ...
+});
+```
+
+## Overriding the callback path
+
+Some gateways already own `/oauth/callback` for a second, unrelated OAuth
+flow — GitHub's per-user App auth, Procore's own API OAuth, Intuit's
+per-company OAuth. Pass `callbackPath` to put the shim's own Entra callback
+somewhere else, and register THAT path (not `/oauth/callback`) as the new
+redirect URI in Entra:
+
+```js
+mountOAuthShim(app, {
+  callbackPath: '/entra/oauth/callback',
+  // ...
+});
+```
 
 ## Single-instance assumption
 

@@ -22,15 +22,29 @@
 //     untouched: same pass-through behavior as before, zero regression risk.
 //
 // Requires ONE new Web-platform redirect URI added to the gateway's existing
-// Entra app registration: `${gatewayBaseUrl}/oauth/callback`. No new app, no
-// group change.
+// Entra app registration: `${gatewayBaseUrl}${callbackPath}` (callbackPath
+// defaults to /oauth/callback — see opts.callbackPath below for gateways
+// that already own that path for a second, unrelated OAuth flow). No new
+// app, no group change.
+//
+// Two entry points:
+//   - mountOAuthShim(app, opts)        — for an existing express app.
+//   - mountOAuthShimRaw(addRoute, opts) — for a hand-rolled router (no
+//     express) that registers routes as addRoute(method, path, handler) and
+//     hands each handler a Node http.IncomingMessage/ServerResponse pair.
+// Both are thin adapters over the same framework-agnostic core, so the
+// actual OAuth logic exists exactly once regardless of how a given gateway
+// is built (see D-001: fix once, not per-gateway).
+//
+// opts.clientId / opts.clientSecret may each be a plain string OR a
+// () => Promise<string> — several gateways (n8n, Ramp, Stripe, ...) resolve
+// these from Key Vault per-request rather than a static env var.
 //
 // Single-instance assumption: pending-authorization state lives in an
 // in-memory Map. This is safe only because every gateway using this shim is
-// pinned to minReplicas=1/maxReplicas=1 (confirmed for unifi and crosswalk in
-// their main.bicep). If a gateway ever scales beyond one replica, this state
-// needs to move to a shared store (e.g. the gateway's own Supabase/Key Vault
-// backing) before adopting this module.
+// pinned to minReplicas=1/maxReplicas=1 (confirmed in each gateway's
+// main.bicep — check this before adopting on a new one). If a gateway ever
+// scales beyond one replica, this state needs to move to a shared store.
 
 import { randomUUID } from 'node:crypto';
 
@@ -45,29 +59,46 @@ function sweep(map, ttlMs) {
   }
 }
 
+async function resolveValue(v) {
+  return typeof v === 'function' ? await v() : v;
+}
+
+// Reads a query param regardless of whether `query` is a plain object
+// (express's req.query) or a URLSearchParams (raw-http adapters).
+function getParam(query, name) {
+  if (query instanceof URLSearchParams) return query.get(name);
+  const v = query?.[name];
+  return typeof v === 'string' ? v : undefined;
+}
+
 /**
- * Mount the OAuth discovery + proxy shim on an existing express app.
+ * Framework-agnostic core. Returns plain async functions that compute what
+ * to respond with; callers (mountOAuthShim / mountOAuthShimRaw) are
+ * responsible for actually writing an HTTP response.
  *
- * @param {import('express').Express} app
  * @param {object} opts
- * @param {string} opts.tenantId            Entra tenant GUID
- * @param {string} opts.clientId            This gateway's Entra app (client) ID
- * @param {string} opts.clientSecret        This gateway's Entra app client secret
- * @param {string} opts.gatewayBaseUrl      This gateway's own https origin, no trailing slash
- * @param {string} opts.entraScope          Full scope string sent to Entra, e.g. `api://<aud>/mcp.access offline_access`
+ * @param {string} opts.tenantId       Entra tenant GUID
+ * @param {string|() => Promise<string>} opts.clientId      This gateway's Entra app (client) ID
+ * @param {string|() => Promise<string>} opts.clientSecret  This gateway's Entra app client secret (only resolved by fixupTokenRedirectUri's caller, never read here directly)
+ * @param {string} opts.gatewayBaseUrl This gateway's own https origin, no trailing slash
+ * @param {string} opts.entraScope     Full scope string sent to Entra, e.g. `api://<aud>/mcp.access offline_access`
  * @param {string[]} [opts.resourceScopesSupported]  Scopes advertised in PRM/ASM (defaults to [entraScope's resource scope])
+ * @param {string} [opts.callbackPath] Path for the shim's own Entra callback (default '/oauth/callback'). Override when the gateway already owns that path for a different OAuth flow (e.g. GitHub's per-user App auth, Procore's, Intuit's).
+ * @param {string} [opts.protectedResourceSuffix] Path suffix for RFC 9728's path-suffixed PRM form (default 'mcp', i.e. served at `/.well-known/oauth-protected-resource/mcp`).
  */
-export function mountOAuthShim(app, opts) {
+export function createOAuthShimCore(opts) {
   const { tenantId, clientId, clientSecret, gatewayBaseUrl, entraScope, resourceScopesSupported } = opts;
+  const callbackPath = opts.callbackPath ?? '/oauth/callback';
+  const protectedResourceSuffix = opts.protectedResourceSuffix ?? 'mcp';
   for (const [k, v] of Object.entries({ tenantId, clientId, clientSecret, gatewayBaseUrl, entraScope })) {
-    if (!v) throw new Error(`mountOAuthShim: opts.${k} is required`);
+    if (!v) throw new Error(`createOAuthShimCore: opts.${k} is required`);
   }
 
   const entraBase = `https://login.microsoftonline.com/${tenantId}`;
   const scopesSupported = resourceScopesSupported ?? [entraScope.split(' ')[0]];
-  const ownCallbackUrl = `${gatewayBaseUrl}/oauth/callback`;
+  const ownCallbackUrl = `${gatewayBaseUrl}${callbackPath}`;
 
-  // stateKey -> { redirectUri, clientState, createdAt }  (consumed at /oauth/callback)
+  // stateKey -> { redirectUri, clientState, createdAt }  (consumed at the callback route)
   const pendingAuthorize = new Map();
   // Entra auth code -> { createdAt }  (consumed at /token; presence alone means
   // "this code was issued against ownCallbackUrl, override redirect_uri")
@@ -79,17 +110,13 @@ export function mountOAuthShim(app, opts) {
     scopes_supported: scopesSupported,
     bearer_methods_supported: ['header'],
   };
-  app.get('/.well-known/oauth-protected-resource', (_req, res) => {
-    res.json(protectedResourceMetadata);
-  });
-  // Path-suffixed form (RFC 9728) for the /mcp resource — every gateway on
-  // this fleet serves MCP at /mcp, so the suffix is fixed.
-  app.get('/.well-known/oauth-protected-resource/mcp', (_req, res) => {
-    res.json(protectedResourceMetadata);
-  });
 
-  app.get('/.well-known/oauth-authorization-server', (_req, res) => {
-    res.json({
+  async function handleProtectedResource() {
+    return protectedResourceMetadata;
+  }
+
+  async function handleAuthServerMetadata() {
+    return {
       issuer: gatewayBaseUrl, // R3: the gateway is the authorization server the client sees
       authorization_endpoint: `${gatewayBaseUrl}/authorize`,
       token_endpoint: `${gatewayBaseUrl}/token`,
@@ -98,33 +125,34 @@ export function mountOAuthShim(app, opts) {
       response_types_supported: ['code'],
       grant_types_supported: ['authorization_code', 'refresh_token'],
       code_challenge_methods_supported: ['S256'],
-    });
-  });
+    };
+  }
 
   // RFC 7591 compatibility stub — mints nothing, persists nothing. Echoes
   // back whatever redirect_uris the caller asked for; real enforcement is
-  // the loopback check in /authorize below, not this response.
-  app.post('/register', (req, res) => {
-    let body = req.body;
-    if (typeof body === 'string') {
-      try { body = JSON.parse(body); } catch { body = {}; }
-    }
+  // the loopback check in handleAuthorize below, not this response.
+  async function handleRegister(body) {
+    const id = await resolveValue(clientId);
     const requestedRedirectUris = Array.isArray(body?.redirect_uris) ? body.redirect_uris : [];
-    res.status(201).json({
-      client_id: clientId,
-      redirect_uris: requestedRedirectUris,
-      grant_types: ['authorization_code', 'refresh_token'],
-      response_types: ['code'],
-      token_endpoint_auth_method: 'none',
-    });
-  });
+    return {
+      status: 201,
+      body: {
+        client_id: id,
+        redirect_uris: requestedRedirectUris,
+        grant_types: ['authorization_code', 'refresh_token'],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'none',
+      },
+    };
+  }
 
-  app.get('/authorize', (req, res) => {
-    const requestedRedirectUri = req.query.redirect_uri;
+  async function handleAuthorize(query) {
+    const id = await resolveValue(clientId);
+    const requestedRedirectUri = getParam(query, 'redirect_uri');
     const isLoopback = typeof requestedRedirectUri === 'string' && LOOPBACK_REDIRECT_RE.test(requestedRedirectUri);
 
-    const params = new URLSearchParams(req.query);
-    params.set('client_id', clientId);
+    const params = new URLSearchParams(query);
+    params.set('client_id', id);
     params.set('scope', entraScope);
     // RFC 8707 resource indicator conflicts with Entra v2's scope-derived
     // audience (AADSTS9010010) — strip it, same as before this module existed.
@@ -133,30 +161,34 @@ export function mountOAuthShim(app, opts) {
     if (!isLoopback) {
       // claude.ai's fixed web callback, or anything else not a loopback form:
       // unchanged pass-through behavior, exactly as before this module.
-      return res.redirect(`${entraBase}/oauth2/v2.0/authorize?${params.toString()}`);
+      return { redirectUrl: `${entraBase}/oauth2/v2.0/authorize?${params.toString()}` };
     }
 
     // Loopback: Entra only recognizes ownCallbackUrl as a registered redirect
     // for this app. Swap it in, remember the caller's real redirect_uri and
-    // state, and hand back control at /oauth/callback below.
+    // state, and hand back control at the callback route below.
     sweep(pendingAuthorize, PENDING_AUTHORIZE_TTL_MS);
     const stateKey = randomUUID();
     pendingAuthorize.set(stateKey, {
       redirectUri: requestedRedirectUri,
-      clientState: typeof req.query.state === 'string' ? req.query.state : '',
+      clientState: getParam(query, 'state') ?? '',
       createdAt: Date.now(),
     });
     params.set('redirect_uri', ownCallbackUrl);
     params.set('state', stateKey);
-    res.redirect(`${entraBase}/oauth2/v2.0/authorize?${params.toString()}`);
-  });
+    return { redirectUrl: `${entraBase}/oauth2/v2.0/authorize?${params.toString()}` };
+  }
 
-  app.get('/oauth/callback', (req, res) => {
-    const { code, state, error, error_description: errorDescription } = req.query;
+  function handleCallback(query) {
+    const code = getParam(query, 'code');
+    const state = getParam(query, 'state');
+    const error = getParam(query, 'error');
+    const errorDescription = getParam(query, 'error_description');
+
     const entry = pendingAuthorize.get(state);
     pendingAuthorize.delete(state);
     if (!entry) {
-      return res.status(400).send('Authorization request expired or was not recognized. Please retry connecting.');
+      return { status: 400, body: 'Authorization request expired or was not recognized. Please retry connecting.' };
     }
 
     const out = new URL(entry.redirectUri);
@@ -170,8 +202,8 @@ export function mountOAuthShim(app, opts) {
     }
     if (entry.clientState) out.searchParams.set('state', entry.clientState);
     out.searchParams.set('iss', gatewayBaseUrl); // RFC 9207 mix-up hardening
-    res.redirect(out.toString());
-  });
+    return { redirectUrl: out.toString() };
+  }
 
   // Wraps the host gateway's existing /token handler. The host still owns
   // the actual fetch to Entra's /token and its own response handling; this
@@ -187,5 +219,111 @@ export function mountOAuthShim(app, opts) {
     return body;
   }
 
-  return { fixupTokenRedirectUri, ownCallbackUrl };
+  return {
+    handleProtectedResource,
+    handleAuthServerMetadata,
+    handleRegister,
+    handleAuthorize,
+    handleCallback,
+    fixupTokenRedirectUri,
+    ownCallbackUrl,
+    callbackPath,
+    protectedResourceSuffixPath: `/.well-known/oauth-protected-resource/${protectedResourceSuffix}`,
+  };
+}
+
+/** Mount the OAuth discovery + proxy shim on an existing express app. See createOAuthShimCore for opts. */
+export function mountOAuthShim(app, opts) {
+  const core = createOAuthShimCore(opts);
+
+  app.get('/.well-known/oauth-protected-resource', async (_req, res) => {
+    res.json(await core.handleProtectedResource());
+  });
+  app.get(core.protectedResourceSuffixPath, async (_req, res) => {
+    res.json(await core.handleProtectedResource());
+  });
+
+  app.get('/.well-known/oauth-authorization-server', async (_req, res) => {
+    res.json(await core.handleAuthServerMetadata());
+  });
+
+  app.post('/register', async (req, res) => {
+    let body = req.body;
+    if (typeof body === 'string') {
+      try { body = JSON.parse(body); } catch { body = {}; }
+    }
+    const { status, body: respBody } = await core.handleRegister(body);
+    res.status(status).json(respBody);
+  });
+
+  app.get('/authorize', async (req, res) => {
+    const { redirectUrl } = await core.handleAuthorize(req.query);
+    res.redirect(redirectUrl);
+  });
+
+  app.get(core.callbackPath, async (req, res) => {
+    const result = await core.handleCallback(req.query);
+    if (result.status) return res.status(result.status).send(result.body);
+    res.redirect(result.redirectUrl);
+  });
+
+  return { fixupTokenRedirectUri: core.fixupTokenRedirectUri, ownCallbackUrl: core.ownCallbackUrl };
+}
+
+/**
+ * Mount the shim on a hand-rolled router that isn't express — registers
+ * routes via addRoute(method, path, (req, res) => ...) and expects each
+ * handler to write the response itself against a raw Node
+ * http.IncomingMessage/ServerResponse pair (Mosyle's pattern).
+ *
+ * @param {(method: string, path: string, handler: (req, res) => void) => void} addRoute
+ * @param {object} opts  Same as createOAuthShimCore, plus:
+ * @param {string} [opts.rawBodyKey] Property on `req` holding the already-parsed request body (default '_body').
+ */
+export function mountOAuthShimRaw(addRoute, opts) {
+  const core = createOAuthShimCore(opts);
+  const bodyKey = opts.rawBodyKey ?? '_body';
+
+  const sendJson = (res, status, obj) => {
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(obj));
+  };
+  const sendText = (res, status, text) => {
+    res.writeHead(status, { 'Content-Type': 'text/plain' });
+    res.end(text);
+  };
+  const sendRedirect = (res, url) => {
+    res.writeHead(302, { Location: url });
+    res.end();
+  };
+  const queryOf = (req) => new URL(req.url, 'http://internal').searchParams;
+
+  addRoute('GET', '/.well-known/oauth-protected-resource', async (_req, res) => {
+    sendJson(res, 200, await core.handleProtectedResource());
+  });
+  addRoute('GET', core.protectedResourceSuffixPath, async (_req, res) => {
+    sendJson(res, 200, await core.handleProtectedResource());
+  });
+
+  addRoute('GET', '/.well-known/oauth-authorization-server', async (_req, res) => {
+    sendJson(res, 200, await core.handleAuthServerMetadata());
+  });
+
+  addRoute('POST', '/register', async (req, res) => {
+    const { status, body } = await core.handleRegister(req[bodyKey]);
+    sendJson(res, status, body);
+  });
+
+  addRoute('GET', '/authorize', async (req, res) => {
+    const { redirectUrl } = await core.handleAuthorize(queryOf(req));
+    sendRedirect(res, redirectUrl);
+  });
+
+  addRoute('GET', core.callbackPath, async (req, res) => {
+    const result = await core.handleCallback(queryOf(req));
+    if (result.status) return sendText(res, result.status, result.body);
+    sendRedirect(res, result.redirectUrl);
+  });
+
+  return { fixupTokenRedirectUri: core.fixupTokenRedirectUri, ownCallbackUrl: core.ownCallbackUrl };
 }
