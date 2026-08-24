@@ -46,7 +46,13 @@
 // main.bicep — check this before adopting on a new one). If a gateway ever
 // scales beyond one replica, this state needs to move to a shared store.
 
-import { randomUUID } from 'node:crypto';
+// CommonJS on purpose: Node's ESM loader can import named bindings from a
+// `module.exports = {...}` object via static analysis (cjs-module-lexer),
+// so ESM consumers (`import { mountOAuthShim } from 'pit-mcp-oauth-shim'`)
+// work unchanged — but a pure-ESM package ("type": "module") cannot be
+// require()'d at all, and n8n/Ramp/Stripe compile to CommonJS (no "type":
+// "module" in their package.json). CJS is the only format both sides accept.
+const { randomUUID } = require('node:crypto');
 
 const LOOPBACK_REDIRECT_RE = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/|$)/i;
 const PENDING_AUTHORIZE_TTL_MS = 10 * 60 * 1000; // generous: a human completing an Entra login
@@ -86,7 +92,7 @@ function getParam(query, name) {
  * @param {string} [opts.callbackPath] Path for the shim's own Entra callback (default '/oauth/callback'). Override when the gateway already owns that path for a different OAuth flow (e.g. GitHub's per-user App auth, Procore's, Intuit's).
  * @param {string} [opts.protectedResourceSuffix] Path suffix for RFC 9728's path-suffixed PRM form (default 'mcp', i.e. served at `/.well-known/oauth-protected-resource/mcp`).
  */
-export function createOAuthShimCore(opts) {
+function createOAuthShimCore(opts) {
   const { tenantId, clientId, clientSecret, gatewayBaseUrl, entraScope, resourceScopesSupported } = opts;
   const callbackPath = opts.callbackPath ?? '/oauth/callback';
   const protectedResourceSuffix = opts.protectedResourceSuffix ?? 'mcp';
@@ -235,7 +241,7 @@ export function createOAuthShimCore(opts) {
 }
 
 /** Mount the OAuth discovery + proxy shim on an existing express app. See createOAuthShimCore for opts. */
-export function mountOAuthShim(app, opts) {
+function mountOAuthShim(app, opts) {
   const core = createOAuthShimCore(opts);
 
   app.get('/.well-known/oauth-protected-resource', async (_req, res) => {
@@ -282,7 +288,7 @@ export function mountOAuthShim(app, opts) {
  * @param {object} opts  Same as createOAuthShimCore, plus:
  * @param {string} [opts.rawBodyKey] Property on `req` holding the already-parsed request body (default '_body').
  */
-export function mountOAuthShimRaw(addRoute, opts) {
+function mountOAuthShimRaw(addRoute, opts) {
   const core = createOAuthShimCore(opts);
   const bodyKey = opts.rawBodyKey ?? '_body';
 
@@ -329,3 +335,5 @@ export function mountOAuthShimRaw(addRoute, opts) {
 
   return { fixupTokenRedirectUri: core.fixupTokenRedirectUri, ownCallbackUrl: core.ownCallbackUrl };
 }
+
+module.exports = { createOAuthShimCore, mountOAuthShim, mountOAuthShimRaw };

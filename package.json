@@ -1,7 +1,6 @@
 {
   "name": "pit-mcp-oauth-shim",
-  "version": "1.1.1",
-  "type": "module",
+  "version": "1.1.2",
   "description": "Shared OAuth discovery + authorize/register/callback/token-redirect-fixup shim for PrecisionIT Entra-gated MCP gateways. mountOAuthShim() for express apps, mountOAuthShimRaw() for hand-rolled routers; clientId/clientSecret may be a string or an async Key-Vault resolver; callbackPath is overridable for gateways that already own /oauth/callback for a second OAuth flow. The host gateway keeps its own inbound JWT validation and write-role gate untouched.",
   "main": "index.js",
   "types": "index.d.ts",
