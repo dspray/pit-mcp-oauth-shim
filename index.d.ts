@@ -20,8 +20,14 @@ export interface OAuthShimOpts {
 }
 
 export interface OAuthShimHandle {
-  /** Fixes up a /token request body's redirect_uri for codes issued via the loopback swap. Pass through the body you're about to forward to Entra's /token endpoint. */
-  fixupTokenRedirectUri(body: Record<string, unknown>): Record<string, unknown>;
+  /**
+   * Fixes up a /token request body's redirect_uri for codes issued via the
+   * loopback swap. Pass through the body you're about to forward to Entra's
+   * /token endpoint. Generic so the caller's own body type (e.g.
+   * Record<string, string>) round-trips unchanged — this only conditionally
+   * adds/overrides a redirect_uri string field.
+   */
+  fixupTokenRedirectUri<T extends Record<string, unknown>>(body: T): T;
   /** This gateway's own Entra callback URL (gatewayBaseUrl + callbackPath). */
   ownCallbackUrl: string;
 }
