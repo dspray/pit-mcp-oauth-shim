@@ -94,6 +94,7 @@ async function run() {
   await runCallbackPathOverride();
   await runAsyncCredentials();
   await runAsyncScope();
+  await runRejectingResolverDoesNotCrash();
   await runRawAdapter();
 
   console.log(process.exitCode ? '\nSOME CHECKS FAILED' : '\nALL CHECKS PASSED');
@@ -181,6 +182,41 @@ async function runAsyncScope() {
   const authRes = await fetch(local('/authorize?redirect_uri=https%3A%2F%2Fclaude.ai%2Fapi%2Fmcp%2Fauth_callback&state=S'), { redirect: 'manual' });
   const loc = new URL(authRes.headers.get('location'));
   assert(loc.searchParams.get('scope') === 'SCOPE_CLIENT_ID/mcp.access offline_access', '/authorize resolves an async entraScope function derived from the async clientId');
+
+  server.close();
+}
+
+// Regression test for a real production incident: a rejecting async
+// credential resolver (e.g. a Key Vault permissions error) must return 500
+// for THAT request, not crash the whole process — Express 4 does not catch
+// a rejected promise from an async route handler on its own, so every route
+// mounted by this module needs its own wrapAsync-style protection.
+async function runRejectingResolverDoesNotCrash() {
+  const base = 'https://crash-mcp.myprecisionit.com';
+  const app = express();
+  app.use(express.json());
+  const failingResolver = async () => { throw new Error('Key Vault permission denied (simulated)'); };
+  mountOAuthShim(app, {
+    tenantId: 'T', clientId: failingResolver, clientSecret: 'S',
+    gatewayBaseUrl: base, entraScope: 'sc', resourceScopesSupported: ['sc'],
+  });
+
+  const server = app.listen(0);
+  await new Promise((r) => server.once('listening', r));
+  const port = server.address().port;
+  const local = (p) => `http://127.0.0.1:${port}${p}`;
+
+  const regRes = await fetch(local('/register'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  assert(regRes.status === 500, '/register with a rejecting clientId resolver returns 500, not a hang/crash');
+
+  const authRes = await fetch(local('/authorize?redirect_uri=https%3A%2F%2Fclaude.ai%2Fapi%2Fmcp%2Fauth_callback&state=S'));
+  assert(authRes.status === 500, '/authorize with a rejecting clientId resolver returns 500, not a hang/crash');
+
+  // The real regression: prove the PROCESS is still alive and answering
+  // OTHER requests after two failures above — this is what actually broke
+  // in production (the whole gateway went down, not just the one request).
+  const prm = await fetch(local('/.well-known/oauth-protected-resource'));
+  assert(prm.status === 200, 'server is still alive and serving other routes after two rejected-resolver failures');
 
   server.close();
 }

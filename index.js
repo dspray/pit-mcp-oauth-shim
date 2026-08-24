@@ -240,40 +240,60 @@ function createOAuthShimCore(opts) {
   };
 }
 
+// Express 4 does NOT catch a rejected promise from an async route handler —
+// an unhandled rejection there crashes the whole process (Node's default
+// since --unhandled-rejections=throw became the LTS default), taking down
+// EVERY tool call on the gateway, not just the failing OAuth request. This
+// bit us for real: a gateway whose Key-Vault-backed clientId resolver
+// rejected (a genuine, pre-existing permissions gap, unrelated to this
+// module) crashed on every /register call instead of returning 500 like its
+// prior hand-written try/catch did. Every route below is wrapped so a
+// failure here can only ever fail ITS OWN request.
+function wrapAsync(handler) {
+  return (req, res) => {
+    Promise.resolve(handler(req, res)).catch((err) => {
+      console.error('pit-mcp-oauth-shim route error:', err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'oauth_shim_error', detail: String(err?.message ?? err) });
+      }
+    });
+  };
+}
+
 /** Mount the OAuth discovery + proxy shim on an existing express app. See createOAuthShimCore for opts. */
 function mountOAuthShim(app, opts) {
   const core = createOAuthShimCore(opts);
 
-  app.get('/.well-known/oauth-protected-resource', async (_req, res) => {
+  app.get('/.well-known/oauth-protected-resource', wrapAsync(async (_req, res) => {
     res.json(await core.handleProtectedResource());
-  });
-  app.get(core.protectedResourceSuffixPath, async (_req, res) => {
+  }));
+  app.get(core.protectedResourceSuffixPath, wrapAsync(async (_req, res) => {
     res.json(await core.handleProtectedResource());
-  });
+  }));
 
-  app.get('/.well-known/oauth-authorization-server', async (_req, res) => {
+  app.get('/.well-known/oauth-authorization-server', wrapAsync(async (_req, res) => {
     res.json(await core.handleAuthServerMetadata());
-  });
+  }));
 
-  app.post('/register', async (req, res) => {
+  app.post('/register', wrapAsync(async (req, res) => {
     let body = req.body;
     if (typeof body === 'string') {
       try { body = JSON.parse(body); } catch { body = {}; }
     }
     const { status, body: respBody } = await core.handleRegister(body);
     res.status(status).json(respBody);
-  });
+  }));
 
-  app.get('/authorize', async (req, res) => {
+  app.get('/authorize', wrapAsync(async (req, res) => {
     const { redirectUrl } = await core.handleAuthorize(req.query);
     res.redirect(redirectUrl);
-  });
+  }));
 
-  app.get(core.callbackPath, async (req, res) => {
+  app.get(core.callbackPath, wrapAsync(async (req, res) => {
     const result = await core.handleCallback(req.query);
     if (result.status) return res.status(result.status).send(result.body);
     res.redirect(result.redirectUrl);
-  });
+  }));
 
   return { fixupTokenRedirectUri: core.fixupTokenRedirectUri, ownCallbackUrl: core.ownCallbackUrl };
 }
@@ -306,32 +326,43 @@ function mountOAuthShimRaw(addRoute, opts) {
   };
   const queryOf = (req) => new URL(req.url, 'http://internal').searchParams;
 
-  addRoute('GET', '/.well-known/oauth-protected-resource', async (_req, res) => {
-    sendJson(res, 200, await core.handleProtectedResource());
-  });
-  addRoute('GET', core.protectedResourceSuffixPath, async (_req, res) => {
-    sendJson(res, 200, await core.handleProtectedResource());
-  });
+  // Same rationale as mountOAuthShim's wrapAsync: don't let a rejected
+  // handler (e.g. an async credential resolver failure) crash the process,
+  // even if the host's own dispatcher already has a try/catch — cheap
+  // insurance, and it can't be relied on for every possible host router.
+  const wrapAsync = (handler) => (req, res) => {
+    Promise.resolve(handler(req, res)).catch((err) => {
+      console.error('pit-mcp-oauth-shim route error:', err);
+      if (!res.headersSent) sendJson(res, 500, { error: 'oauth_shim_error', detail: String(err?.message ?? err) });
+    });
+  };
 
-  addRoute('GET', '/.well-known/oauth-authorization-server', async (_req, res) => {
+  addRoute('GET', '/.well-known/oauth-protected-resource', wrapAsync(async (_req, res) => {
+    sendJson(res, 200, await core.handleProtectedResource());
+  }));
+  addRoute('GET', core.protectedResourceSuffixPath, wrapAsync(async (_req, res) => {
+    sendJson(res, 200, await core.handleProtectedResource());
+  }));
+
+  addRoute('GET', '/.well-known/oauth-authorization-server', wrapAsync(async (_req, res) => {
     sendJson(res, 200, await core.handleAuthServerMetadata());
-  });
+  }));
 
-  addRoute('POST', '/register', async (req, res) => {
+  addRoute('POST', '/register', wrapAsync(async (req, res) => {
     const { status, body } = await core.handleRegister(req[bodyKey]);
     sendJson(res, status, body);
-  });
+  }));
 
-  addRoute('GET', '/authorize', async (req, res) => {
+  addRoute('GET', '/authorize', wrapAsync(async (req, res) => {
     const { redirectUrl } = await core.handleAuthorize(queryOf(req));
     sendRedirect(res, redirectUrl);
-  });
+  }));
 
-  addRoute('GET', core.callbackPath, async (req, res) => {
+  addRoute('GET', core.callbackPath, wrapAsync(async (req, res) => {
     const result = await core.handleCallback(queryOf(req));
     if (result.status) return sendText(res, result.status, result.body);
     sendRedirect(res, result.redirectUrl);
-  });
+  }));
 
   return { fixupTokenRedirectUri: core.fixupTokenRedirectUri, ownCallbackUrl: core.ownCallbackUrl };
 }
